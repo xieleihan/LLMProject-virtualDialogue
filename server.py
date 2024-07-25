@@ -26,6 +26,9 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.memory import ConversationTokenBufferMemory
 from transformers import GPT2TokenizerFast
 
+# Redis存储聊天历史持久化
+from langchain_community.chat_message_histories import RedisChatMessageHistory
+
 app = FastAPI()
 
 @tool
@@ -111,11 +114,12 @@ class Master:
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 ("system",self.SYSTEMPL.format(who_are_you=self.MOODS[self.qingxu]["roleSet"])),
+                MessagesPlaceholder(variable_name="self.MEMOORY_KEY"),
                 ("user","{input}"),
                 MessagesPlaceholder(variable_name="agent_scratchpad"),
             ]
         )
-        self.memory = ""
+        self.memory = self.get_memory()
         tools = [search, get_info_from_local_db]
         agent = create_openai_functions_agent(
             self.chatmodel,
@@ -130,7 +134,8 @@ class Master:
             memory_key = self.MEMORY_KEY,
             output_key= "output",
             return_messages=True,
-            max_token_limit=2000
+            max_token_limit=2000,
+            chat_memory= self.memory
         )
         self.agent_executor = AgentExecutor(
             agent = agent,
@@ -138,13 +143,38 @@ class Master:
             memory = memory,
             tools = tools
         )
-        
+
+    def get_memory(self):
+        chat_message_history = RedisChatMessageHistory(
+            url="redis://localhost:6379/0", session_id="session"
+        )
+        print(chat_message_history.messages)
+        store_message = chat_message_history.messages
+        if len(store_message) > 10:
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        self.SYSTEMPL+"\n 这是一段我们之间对话聊天的记忆,请你对其进行总结摘要,摘要使用第一人称'我',并且提取其中的关键信息,以便在后续对话中,可以调用记忆中的关键信息,来进行正确的回答."
+                    ),
+                    (
+                        "user",
+                        "{input}"
+                    )
+                ]
+            )
+            chain = prompt | ChatTongyi(temperature =0,model_name="qwen-vl-max", dashscope_api_key=dashscope_api_key)
+            summary = chain.invoke({"input":store_message, "who_are_you":self.MOODS[self.qingxu]["roleSet"]})
+            print("summary=>",summary)
+            chat_message_history.clear()
+            chat_message_history.add_message(summary)
+        return chat_message_history
 
     def run(self,query):
         qinxu = self.qingxu_chain(query)
         print("当前用户情绪=>",qinxu)
         print("情绪输出=>",self.MOODS[self.qingxu]["roleSet"])
-        result = self.agent_executor.invoke({"input":query})
+        result = self.agent_executor.invoke({"input":query, "chat_history":self.memory.messages})
         print("结果=>",result)
         # 处理结果
         if isinstance(result, dict) and 'output' in result:
